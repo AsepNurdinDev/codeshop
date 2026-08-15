@@ -1,0 +1,10 @@
+.git
+.gitignore
+bin/
+*.tmp
+*.log
+.env
+Dockerfile*
+Makefile
+README.md
+SECURITY.md
