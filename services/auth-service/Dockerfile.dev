@@ -1,14 +1,20 @@
-FROM golang:1.22-alpine
+# syntax=docker/dockerfile:1
+
+# Development image: full Go toolchain + air for hot-reload on file
+# changes, so `docker compose up` gives a fast local edit-run loop without
+# needing Go installed on the host. Not used in production (see Dockerfile).
+FROM golang:1.22-bookworm
 
 WORKDIR /app
 
-RUN apk add --no-cache git ca-certificates protobuf-dev
+# air watches for .go file changes and rebuilds/restarts the server.
+RUN go install github.com/air-verse/air@v1.52.3
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
-EXPOSE 50051
+EXPOSE 8080 9090
 
-CMD ["go", "run", "cmd/server/main.go"]
+CMD ["air", "-c", ".air.toml"]

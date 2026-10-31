@@ -1,153 +1,222 @@
+// Command server is the Auth Service entry point. It wires together the
+// REST API (public, docs/architecture/API_DESIGN.md), the internal gRPC
+// API (proto/auth.proto), PostgreSQL, Redis, and the RabbitMQ event
+// publisher, and runs the HTTP and gRPC servers concurrently until an
+// interrupt signal triggers a graceful shutdown.
 package main
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
+	"errors"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/config"
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/handler"
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/middleware"
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/repository"
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/security"
-	"github.com/asepnrdn/codeshop/services/auth-service/internal/service"
-	pb "github.com/asepnrdn/codeshop/services/auth-service/proto/v1"
-	_ "github.com/lib/pq"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+
+	"github.com/codeshop-platform/auth-service/internal/config"
+	"github.com/codeshop-platform/auth-service/internal/event"
+	"github.com/codeshop-platform/auth-service/internal/grpcserver"
+	"github.com/codeshop-platform/auth-service/internal/handler"
+	appmiddleware "github.com/codeshop-platform/auth-service/internal/middleware"
+	"github.com/codeshop-platform/auth-service/internal/repository"
+	"github.com/codeshop-platform/auth-service/internal/service"
+	"github.com/codeshop-platform/auth-service/pkg/pb"
 )
 
 func main() {
-	cfg := config.LoadConfig()
-	log.Printf("Starting CodeShop Auth Service [%s]...", cfg.Environment)
+	// .env is optional and only used for local development convenience;
+	// in Docker/Kubernetes, real environment variables are used instead.
+	_ = godotenv.Load()
 
-	// 1. Initialize Database
-	db, err := initDatabase(cfg.DatabaseURL)
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer db.Close()
-
-	// 2. Initialize Redis (optional connection, logs warning if fails)
-	rdb := initRedis(cfg.RedisURL)
-	if rdb != nil {
-		defer rdb.Close()
+		log.Fatalf("load config: %v", err)
 	}
 
-	// 3. Initialize Security & Managers
-	jwtMgr := security.NewJWTManager(
-		cfg.JWTSecret,
-		cfg.JWTIssuer,
-		cfg.AccessTokenExpiration,
-		cfg.RefreshTokenExpiration,
-	)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// 4. Initialize Repositories & Services
-	userRepo := repository.NewPostgresUserRepository(db)
-	tokenRepo := repository.NewTokenRepository(db, rdb)
-	authSvc := service.NewAuthService(userRepo, tokenRepo, jwtMgr)
-
-	// 5. Initialize gRPC Server
-	grpcServer := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(
-			middleware.UnaryRecoveryInterceptor(),
-			middleware.UnaryLoggingInterceptor(),
-		),
-	)
-
-	// Register Auth Handler
-	authHandler := handler.NewGRPCHandler(authSvc)
-	pb.RegisterAuthServiceServer(grpcServer, authHandler)
-
-	// Register Health Handler
-	healthHandler := handler.NewHealthHandler(db, rdb)
-	grpc_health_v1.RegisterHealthServer(grpcServer, healthHandler)
-
-	// Register Reflection for dev tools (grpcurl)
-	reflection.Register(grpcServer)
-
-	// 6. Listen & Serve
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.GRPCPort))
+	// --- PostgreSQL (Auth DB - docs/decisions/ADR-006-postgresql-database.md) ---
+	dbPool, err := connectPostgres(ctx, cfg)
 	if err != nil {
-		log.Fatalf("Failed to listen on port %s: %v", cfg.GRPCPort, err)
+		log.Fatalf("connect postgres: %v", err)
+	}
+	defer dbPool.Close()
+
+	// --- Redis (sessions/rate limiting - docs/decisions/ADR-007-redis.md) ---
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+	defer redisClient.Close()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Fatalf("connect redis: %v", err)
 	}
 
-	// Channel for graceful shutdown signals
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
+	// --- RabbitMQ (publishes UserRegistered - docs/architecture/EVENT_DESIGN.md) ---
+	// Non-fatal if unavailable: Auth Service's primary responsibilities
+	// (register/login/validate) do not depend on the message broker, per
+	// the failure-mode philosophy in docs/architecture/ARCHITECTURE.md §12.
+	publisher, err := event.NewRabbitMQPublisher(cfg.RabbitMQURL, cfg.RabbitMQExchange)
+	if err != nil {
+		log.Printf("warn: rabbitmq unavailable, UserRegistered events will not be published: %v", err)
+		publisher = nil
+	} else {
+		defer publisher.Close()
+	}
+
+	// --- wiring ---
+	userRepo := repository.NewUserRepository(dbPool)
+	tokenRepo := repository.NewTokenRepository(redisClient, dbPool)
+	tokenSvc := service.NewTokenService(cfg)
+	authSvc := service.NewAuthService(cfg, userRepo, tokenRepo, tokenSvc, publisher, redisClient)
+
+	httpServer := buildHTTPServer(cfg, authSvc, tokenSvc, dbPool, redisClient)
+	grpcServer := buildGRPCServer(authSvc)
+
+	// --- run servers concurrently ---
+	errCh := make(chan error, 2)
 
 	go func() {
-		log.Printf("Auth Service gRPC server listening on port %s", cfg.GRPCPort)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("gRPC server error: %v", err)
+		log.Printf("auth-service HTTP server listening on :%s", cfg.HTTPPort)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
 		}
 	}()
 
-	// Wait for shutdown signal
-	<-stopChan
-	log.Println("Shutting down Auth Service gracefully...")
-
-	// Graceful shutdown with 10s timeout
-	stopped := make(chan struct{})
+	grpcLis, err := net.Listen("tcp", ":"+cfg.GRPCPort)
+	if err != nil {
+		log.Fatalf("listen grpc: %v", err)
+	}
 	go func() {
-		grpcServer.GracefulStop()
-		close(stopped)
+		log.Printf("auth-service gRPC server listening on :%s", cfg.GRPCPort)
+		if err := grpcServer.Serve(grpcLis); err != nil {
+			errCh <- err
+		}
 	}()
 
 	select {
-	case <-stopped:
-		log.Println("Auth Service stopped cleanly.")
-	case <-time.After(10 * time.Second):
-		log.Println("Force stopping Auth Service due to timeout.")
-		grpcServer.Stop()
+	case <-ctx.Done():
+		log.Println("shutdown signal received")
+	case err := <-errCh:
+		log.Printf("server error: %v", err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http graceful shutdown error: %v", err)
+	}
+	grpcServer.GracefulStop()
+
+	log.Println("auth-service stopped")
+}
+
+func connectPostgres(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	poolCfg.MaxConns = cfg.DatabaseMaxConns
+	poolCfg.ConnConfig.ConnectTimeout = cfg.DatabaseConnTimeout
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, cfg.DatabaseConnTimeout)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
+}
+
+func buildHTTPServer(
+	cfg *config.Config,
+	authSvc service.AuthService,
+	tokenSvc service.TokenService,
+	dbPool *pgxpool.Pool,
+	redisClient *redis.Client,
+) *http.Server {
+	r := chi.NewRouter()
+
+	r.Use(appmiddleware.RequestID)
+	r.Use(appmiddleware.Recovery)
+	r.Use(cors.Handler(cors.Options{
+		// Public REST is meant to sit behind the API Gateway / CDN
+		// (docs/architecture/ARCHITECTURE.md §4-6); permissive CORS here
+		// is acceptable for local/dev use and is expected to be tightened
+		// at the Gateway/CDN layer in production.
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID"},
+		AllowCredentials: false,
+		MaxAge:           300,
+	}))
+
+	healthHandler := handler.NewHealthHandler(dbPool, redisClient)
+	authHandler := handler.NewAuthHandler(authSvc)
+	userHandler := handler.NewUserHandler(authSvc)
+
+	r.Get("/healthz", healthHandler.Live)
+	r.Get("/readyz", healthHandler.Ready)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Route("/auth", func(r chi.Router) {
+			r.Post("/register", authHandler.Register)
+			r.Post("/login", authHandler.Login)
+			r.Post("/refresh", authHandler.Refresh)
+			r.Post("/logout", authHandler.Logout)
+		})
+
+		r.Route("/users", func(r chi.Router) {
+			r.Group(func(r chi.Router) {
+				r.Use(appmiddleware.RequireAuth(tokenSvc))
+				r.Get("/me", userHandler.Me)
+			})
+		})
+	})
+
+	return &http.Server{
+		Addr:              ":" + cfg.HTTPPort,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 }
 
-func initDatabase(dbURL string) (*sql.DB, error) {
-	db, err := sql.Open("postgres", dbURL)
-	if err != nil {
-		return nil, fmt.Errorf("error opening DB connection: %w", err)
-	}
+func buildGRPCServer(authSvc service.AuthService) *grpc.Server {
+	s := grpc.NewServer()
+	pb.RegisterAuthServiceServer(s, grpcserver.New(authSvc))
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// Standard gRPC health-checking protocol, so Kubernetes/other services
+	// can probe readiness the same way for every internal gRPC service.
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(s, healthSrv)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Reflection makes local debugging with grpcurl straightforward,
+	// consistent with the tooling note in
+	// docs/decisions/ADR-003-grpc-internal-communication.md ("memerlukan
+	// tooling tambahan (mis. grpcurl)").
+	reflection.Register(s)
 
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("error pinging DB: %w", err)
-	}
-
-	log.Println("Connected to PostgreSQL successfully.")
-	return db, nil
-}
-
-func initRedis(redisURL string) *redis.Client {
-	opt, err := redis.ParseURL(redisURL)
-	if err != nil {
-		log.Printf("Warning: Redis URL invalid (%v). Proceeding without Redis cache.", err)
-		return nil
-	}
-
-	rdb := redis.NewClient(opt)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Printf("Warning: Failed to connect to Redis (%v). Token revocation will rely solely on PostgreSQL.", err)
-		return nil
-	}
-
-	log.Println("Connected to Redis successfully.")
-	return rdb
+	return s
 }

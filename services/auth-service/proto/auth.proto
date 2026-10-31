@@ -1,45 +1,29 @@
 syntax = "proto3";
 
+// Internal gRPC contract for the Auth Service.
+//
+// Per docs/architecture/SERVICE_CATALOG.md §2, the Auth Service exposes:
+//   - gRPC internal API: ValidateToken, GetUser
+//     consumed by: API Gateway, Order Service, Download Service.
+//
+// Per docs/decisions/ADR-003-grpc-internal-communication.md, all internal
+// service-to-service communication uses gRPC with strongly-typed contracts.
 package codeshop.auth.v1;
 
-option go_package = "github.com/asepnrdn/codeshop/services/auth-service/proto/v1;authv1";
-
-import "google/protobuf/timestamp.proto";
+option go_package = "github.com/codeshop-platform/auth-service/pkg/pb;pb";
 
 service AuthService {
-  rpc Register(RegisterRequest) returns (RegisterResponse);
-  rpc Login(LoginRequest) returns (LoginResponse);
+  // ValidateToken verifies a JWT access token's signature and expiry and
+  // returns the identity encoded in it. Intended to be stateless (no DB
+  // round-trip) so that Auth Service downtime does not block other
+  // services from validating already-issued tokens
+  // (see ARCHITECTURE.md §12 Failure Scenarios).
   rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
-  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
-  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // GetUser returns public user identity information by user ID.
+  // Used by other services that only hold a user_id reference
+  // (cross-service reference by ID, see DATABASE_DESIGN.md §8).
   rpc GetUser(GetUserRequest) returns (GetUserResponse);
-}
-
-message RegisterRequest {
-  string email = 1;
-  string password = 2;
-  string full_name = 3;
-}
-
-message RegisterResponse {
-  string user_id = 1;
-  string email = 2;
-  string full_name = 3;
-  string role = 4;
-  google.protobuf.Timestamp created_at = 5;
-}
-
-message LoginRequest {
-  string email = 1;
-  string password = 2;
-}
-
-message LoginResponse {
-  string access_token = 1;
-  string refresh_token = 2;
-  int64 expires_in = 3; // in seconds
-  string token_type = 4; // "Bearer"
-  string user_id = 5;
 }
 
 message ValidateTokenRequest {
@@ -51,28 +35,8 @@ message ValidateTokenResponse {
   string user_id = 2;
   string email = 3;
   string role = 4;
-  google.protobuf.Timestamp expires_at = 5;
-}
-
-message RefreshTokenRequest {
-  string refresh_token = 1;
-}
-
-message RefreshTokenResponse {
-  string access_token = 1;
-  string refresh_token = 2;
-  int64 expires_in = 3;
-  string token_type = 4;
-}
-
-message LogoutRequest {
-  string refresh_token = 1;
-  string user_id = 2;
-}
-
-message LogoutResponse {
-  bool success = 1;
-  string message = 2;
+  // reason is populated when valid == false (e.g. "expired", "invalid_signature").
+  string reason = 5;
 }
 
 message GetUserRequest {
@@ -85,6 +49,4 @@ message GetUserResponse {
   string full_name = 3;
   string role = 4;
   string status = 5;
-  google.protobuf.Timestamp created_at = 6;
-  google.protobuf.Timestamp updated_at = 7;
 }

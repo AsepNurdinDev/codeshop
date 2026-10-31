@@ -1,5 +1,17 @@
 # Event Design — CodeShop
 
+## 1a. Ownership Correction (Phase 1.1)
+
+Phase 1 dokumentasi awal menggunakan `PaymentSuccess`/`OrderPaid` sebagai satu event yang digabung, dipublish oleh Payment Service, dengan status order diupdate **synchronous** oleh Payment Service via gRPC `UpdateOrderStatus` sebelum publish.
+
+Setelah review arsitektur (Phase 1.1), keputusan ini **dikoreksi**:
+
+- Payment Service **tidak lagi** memanggil `UpdateOrderStatus` pada Order Service. Payment Service hanya boleh menulis ke domainnya sendiri (`Payment`, `PaymentTransaction`, dst. — lihat `DATABASE_DESIGN.md` §5).
+- Event pembayaran dipisah menjadi `PaymentSucceeded` dan `PaymentFailed`, dipublish oleh Payment Service sebagai pernyataan otoritatif tentang **pembayaran**, bukan tentang **order**.
+- `OrderPaid` tetap ada sebagai event terpisah, tetapi sekarang dipublish oleh **Order Service** — bukan Payment Service — setelah Order Service sendiri memutuskan untuk mentransisikan order ke `PAID` sebagai reaksi terhadap `PaymentSucceeded`.
+
+Alasan koreksi: pada desain awal, Payment Service secara implisit menjadi penulis (writer) untuk `OrderStatus`, yang melanggar prinsip *single writer per aggregate* dan bertentangan dengan prinsip database-per-service/ownership yang sudah dianut di seluruh sistem (ADR-002). Desain baru memastikan setiap service hanya pernah menulis state miliknya sendiri, dengan konsekuensi berupa satu hop asynchronous tambahan (lihat `ARCHITECTURE.md` §9 untuk trade-off latensi vs. ownership ini) yang dianggap dapat diterima secara bisnis.
+
 ## 1. Evaluasi Kebutuhan Event
 
 Daftar kandidat event dari brief awal dievaluasi sebagai berikut:
@@ -9,9 +21,9 @@ Daftar kandidat event dari brief awal dievaluasi sebagai berikut:
 | `UserRegistered` | **Dipakai** | Memicu email welcome via Notification Service. |
 | `OrderCreated` | **Dipakai** | Memicu notifikasi "order dibuat, menunggu pembayaran". |
 | `PaymentPending` | **Dipakai (opsional trigger notifikasi)** | Berguna untuk observability/analytics, notifikasi ke user bersifat opsional (tidak wajib email). |
-| `PaymentSuccess` | **Digabung menjadi `OrderPaid`** | `PaymentSuccess` dan `OrderPaid` pada dasarnya merepresentasikan momen yang sama dari perspektif bisnis (pembayaran berhasil = order menjadi PAID). Memisahkan keduanya sebagai dua event terpisah berisiko duplikasi consumer logic dan ambiguitas "mana yang jadi trigger utama". Diputuskan: **`OrderPaid` adalah event tunggal** yang dipublish oleh Payment Service setelah update status order berhasil. |
-| `PaymentFailed` | **Dipakai** | Memicu notifikasi kegagalan ke user. |
-| `OrderPaid` | **Dipakai** (lihat catatan di atas) | Trigger utama untuk Download Service (buat entitlement) dan Notification Service. |
+| `PaymentSucceeded` | **Dipakai (revisi Phase 1.1)** | Sebelumnya diberi nama `PaymentSuccess` dan digabung konsepnya dengan `OrderPaid`; setelah koreksi ownership (§1a), `PaymentSucceeded` kini menjadi event **terpisah** yang murni menyatakan fakta pembayaran, dipublish oleh Payment Service, dikonsumsi oleh Order Service (bukan oleh Download/Notification Service secara langsung). |
+| `PaymentFailed` | **Dipakai** | Memicu notifikasi kegagalan ke user; dikonsumsi Order Service (untuk kemungkinan transisi/analytics) dan Notification Service. |
+| `OrderPaid` | **Dipakai — sekarang dipublish oleh Order Service** (koreksi §1a) | Trigger utama untuk Download Service (buat entitlement) dan Notification Service. Tidak lagi dipublish oleh Payment Service. |
 | `DownloadRequested` | **Tidak dipakai sebagai event** | Bersifat synchronous request-response (user menunggu signed URL langsung), tidak ada consumer asynchronous yang membutuhkan notifikasi "permintaan download dibuat" — akan menjadi over-engineering. |
 | `DownloadGranted` | **Dipakai** | Untuk audit trail dan opsional notifikasi "produk Anda siap diunduh". |
 | `DownloadCompleted` | **Tidak dipakai pada MVP** | Memerlukan callback dari object storage yang menambah kompleksitas signifikan (event dari S3-compatible storage) tanpa kebutuhan bisnis mendesak di MVP. Dicatat sebagai kandidat Phase 2 jika dibutuhkan analytics penyelesaian download. |
@@ -23,7 +35,8 @@ Daftar kandidat event dari brief awal dievaluasi sebagai berikut:
 ```text
 UserRegistered
 OrderCreated
-PaymentPending   (opsional/analytics)
+PaymentPending      (opsional/analytics)
+PaymentSucceeded
 PaymentFailed
 OrderPaid
 DownloadGranted
@@ -57,8 +70,9 @@ Struktur konseptual (bukan skema final/kode):
 | `UserRegistered` | Auth Service | Notification Service |
 | `OrderCreated` | Order Service | Notification Service |
 | `PaymentPending` | Payment Service | (analytics/observability, tanpa consumer bisnis wajib di MVP) |
-| `PaymentFailed` | Payment Service | Notification Service |
-| `OrderPaid` | Payment Service | Download Service, Notification Service |
+| `PaymentSucceeded` | Payment Service | **Order Service** (trigger transisi ke `PAID`) |
+| `PaymentFailed` | Payment Service | Order Service (analytics/logging), Notification Service |
+| `OrderPaid` | **Order Service** (koreksi §1a) | Download Service, Notification Service |
 | `DownloadGranted` | Download Service | Notification Service |
 
 ## 5. Event Version
@@ -77,7 +91,10 @@ Struktur konseptual (bukan skema final/kode):
 
 ## 8. Idempotency
 
-- Setiap consumer menyimpan/mengecek `event_id` yang sudah diproses (dedup table atau mekanisme setara) sebelum menjalankan efek samping, khususnya untuk `OrderPaid` (pembuatan entitlement tidak boleh duplikat) dan Notification Service (email tidak boleh terkirim dobel).
+- Setiap consumer menyimpan/mengecek `event_id` yang sudah diproses (dedup table atau mekanisme setara) sebelum menjalankan efek samping, khususnya untuk:
+  - **Order Service** yang mengonsumsi `PaymentSucceeded` — transisi `PENDING_PAYMENT → PAID` tidak boleh dieksekusi dua kali untuk order yang sama (idempotency di sini krusial karena ini adalah satu-satunya jalur order menjadi `PAID`).
+  - **Download Service** yang mengonsumsi `OrderPaid` — pembuatan `DownloadEntitlement` tidak boleh duplikat.
+  - **Notification Service** — email tidak boleh terkirim dobel.
 
 ## 9. Retry
 
@@ -97,8 +114,9 @@ Struktur konseptual (bukan skema final/kode):
 
 ## 12. Eventual Consistency
 
-- Status order (source of truth di Order DB) diupdate **synchronous** oleh Payment Service melalui gRPC sebelum event `OrderPaid` dipublish — ini mengurangi window eventual consistency untuk data kritikal (status order).
-- Efek turunan seperti pembuatan `DownloadEntitlement` (jika menggunakan event, opsi optimasi) dan pengiriman notifikasi bersifat **eventually consistent** — ada jeda singkat yang dapat diterima secara bisnis (user melihat "processing" sesaat sebelum entitlement aktif).
+- **Revisi Phase 1.1**: status order **tidak lagi** diupdate synchronous oleh Payment Service. Transisi `PENDING_PAYMENT → PAID` terjadi secara **eventually consistent**, dipicu oleh konsumsi event `PaymentSucceeded` di Order Service. Window eventual consistency ini kecil dalam praktik (dalam orde detik, tergantung throughput RabbitMQ) dan dipantau sebagai metric (`payment-to-order-paid lag`, lihat `OBSERVABILITY.md`).
+- Efek turunan lebih lanjut — pembuatan `DownloadEntitlement` dan pengiriman notifikasi — tetap bersifat **eventually consistent** di atas eventual consistency order itu sendiri (dua lapis), yang secara bisnis dapat diterima: user melihat status "menunggu konfirmasi" sesaat sebelum entitlement aktif, bukan penolakan permanen.
+- Trade-off ini didokumentasikan secara eksplisit di `ARCHITECTURE.md` §9 sebagai keputusan sadar untuk menjaga ownership boundary yang bersih, bukan sebagai kompromi yang tidak disengaja.
 
 ## 13. Event Flow Diagram
 
@@ -113,8 +131,12 @@ sequenceDiagram
     Order->>MQ: publish OrderCreated
     MQ->>Notif: consume OrderCreated
 
-    Payment->>Order: UpdateOrderStatus(PAID) [gRPC, synchronous]
-    Payment->>MQ: publish OrderPaid
+    Payment->>Payment: verify webhook, transition Payment to SUCCEEDED
+    Payment->>MQ: publish PaymentSucceeded
+
+    MQ->>Order: consume PaymentSucceeded
+    Order->>Order: validate PENDING_PAYMENT, transition to PAID (idempotent by event_id)
+    Order->>MQ: publish OrderPaid
 
     MQ->>Download: consume OrderPaid
     Download->>Download: create DownloadEntitlement (idempotent by event_id)
@@ -125,5 +147,6 @@ sequenceDiagram
     Notif->>Notif: send email(s)
 
     Payment->>MQ: publish PaymentFailed (alternate path)
+    MQ->>Order: consume PaymentFailed (analytics/logging, no order-owning side effect required)
     MQ->>Notif: consume PaymentFailed
 ```

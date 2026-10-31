@@ -3,7 +3,7 @@
 ## 1. API Gateway
 
 - **Purpose**: Single public entry point untuk seluruh client request.
-- **Responsibilities**: routing, TLS termination (di belakang Cloudflare), authentication token pass-through/validation, rate limiting, request ID/correlation ID injection, request/response transformation (REST publik ↔ gRPC internal).
+- **Responsibilities**: routing, TLS termination (di belakang Cloudflare), **coarse** authentication enforcement (validasi struktural/signature JWT, bukan business authorization), rate limiting, request ID/correlation ID injection, request/response transformation (REST publik ↔ gRPC internal). **API Gateway secara eksplisit BUKAN otoritas otorisasi bisnis** — lihat `ARCHITECTURE.md` §11a untuk penjelasan lengkap dan alasan desain.
 - **Data ownership**: tidak memiliki database sendiri (stateless), kecuali cache rate-limit counter di Redis (shared infra, bukan data domain).
 - **Database**: tidak ada.
 - **APIs**: seluruh REST public API (lihat `API_DESIGN.md`).
@@ -53,37 +53,39 @@
 
 ## 4. Order Service
 
-- **Purpose**: Mengelola siklus hidup order, termasuk **sub-domain Cart**.
-- **Responsibilities**: manajemen cart (sebagai order berstatus `DRAFT`), checkout (konversi cart → order `PENDING_PAYMENT`), snapshot harga saat checkout, pelacakan status order, penyediaan data entitlement (order `PAID` = entitlement download).
-- **Data ownership**: `Cart` (opsional sebagai representasi `Order` status `DRAFT`), `CartItem`, `Order`, `OrderItem`.
+- **Purpose**: Mengelola siklus hidup order, termasuk **sub-domain Cart**. Pemilik tunggal `OrderLifecycle`.
+- **Ownership correction (Phase 1.1)**: Order Service adalah **satu-satunya** pemilik `Order`, `OrderItem`, `OrderStatus`, dan `OrderLifecycle` (state machine di `ARCHITECTURE.md` §11b). Transisi `PENDING_PAYMENT → PAID` **hanya** dipicu oleh Order Service sendiri saat mengonsumsi event `PaymentSucceeded` dari Payment Service — tidak ada service lain, termasuk Payment Service, yang diberi izin menulis `OrderStatus` secara langsung (gRPC `UpdateOrderStatus` yang dipanggil pihak eksternal dihapus dari desain; lihat `EVENT_DESIGN.md` §1a untuk riwayat koreksi ini).
+- **Responsibilities**: manajemen cart (sebagai order berstatus `DRAFT`), checkout (konversi cart → order `PENDING_PAYMENT`), snapshot harga saat checkout, menjalankan state machine order sepenuhnya (termasuk transisi ke `PAID`, `CANCELLED`, `COMPLETED`), penyediaan data entitlement (order `PAID`/`COMPLETED` = entitlement download berhak diberikan), expiry order `PENDING_PAYMENT` yang tidak kunjung dibayar.
+- **Data ownership**: `Cart` (representasi `Order` status `DRAFT`), `CartItem`, `Order`, `OrderItem`.
 - **Database**: Order DB (PostgreSQL).
-- **APIs**: gRPC internal (`AddCartItem`, `CreateOrder`, `GetOrder`, `UpdateOrderStatus`, `CheckEntitlement`) + REST publik (`/cart/*`, `/orders/*`).
+- **APIs**: gRPC internal (`AddCartItem`, `CreateOrder`, `GetOrder` [read-only, dipanggil Payment & Download Service], `CheckEntitlement`) + REST publik (`/cart/*`, `/orders/*`). **Tidak ada** `UpdateOrderStatus` yang dapat dipanggil service lain — perubahan status hanya terjadi secara internal sebagai reaksi terhadap event.
 - **Dependencies**: Catalog Service (validasi produk & harga), Auth Service (validasi identitas).
-- **Inbound communication**: gRPC dari Gateway, Payment Service (update status), Download Service (cek entitlement).
-- **Outbound communication**: gRPC ke Catalog & Auth.
-- **Events produced**: `OrderCreated`.
-- **Events consumed**: `PaymentSuccess`/`PaymentFailed` *(untuk update status; lihat catatan di `EVENT_DESIGN.md` — pada MVP, update status dilakukan secara synchronous oleh Payment Service via gRPC, event dipublish setelahnya untuk consumer lain)*.
-- **Security requirements**: hanya pemilik order (ownership check) yang dapat melihat/mengubah order miliknya; price snapshot mencegah manipulasi harga oleh client.
-- **Scaling strategy**: horizontal; write path (checkout) memerlukan konsistensi transaksional dalam database sendiri.
-- **Failure modes**: jika Catalog Service tidak dapat dihubungi saat checkout, checkout ditolak dengan error jelas (fail-fast) — tidak membuat order dengan data produk yang tidak tervalidasi.
-- **Observability requirements**: cart abandonment rate, checkout success/fail rate, order status distribution, average order value (business metric).
+- **Inbound communication**: gRPC read-only dari Gateway, Payment Service (`GetOrder`), Download Service (`CheckEntitlement`); event `PaymentSucceeded`/`PaymentFailed` dari RabbitMQ.
+- **Outbound communication**: gRPC ke Catalog & Auth; event `OrderCreated`/`OrderPaid` ke RabbitMQ.
+- **Events produced**: `OrderCreated`, `OrderPaid`.
+- **Events consumed**: `PaymentSucceeded`, `PaymentFailed` — konsumsi ini **idempotent** (dedup by `event_id`, lihat `EVENT_DESIGN.md` §8) dan merupakan **satu-satunya** mekanisme yang boleh mengubah `OrderStatus` menjadi `PAID`.
+- **Security requirements**: hanya pemilik order (ownership check) yang dapat melihat/mengubah order miliknya; price snapshot mencegah manipulasi harga oleh client; lihat Authorization Boundary di `ARCHITECTURE.md` §11a — Order Service tidak mempercayai klaim status apa pun dari Gateway atau service lain tanpa validasi internal.
+- **Scaling strategy**: horizontal; write path (checkout, status transition) memerlukan konsistensi transaksional dalam database sendiri.
+- **Failure modes**: jika Catalog Service tidak dapat dihubungi saat checkout, checkout ditolak dengan error jelas (fail-fast) — tidak membuat order dengan data produk yang tidak tervalidasi. Jika event `PaymentSucceeded` gagal dikonsumsi berulang kali, pesan masuk DLQ dan order tetap `PENDING_PAYMENT` hingga direkonsiliasi secara manual/operasional (lihat `RELIABILITY.md`).
+- **Observability requirements**: cart abandonment rate, checkout success/fail rate, order status distribution, order expiry rate, average order value (business metric), lag antara `PaymentSucceeded` diterima dan `OrderPaid` dipublish (consistency-window metric).
 
 ## 5. Payment Service
 
-- **Purpose**: Mengelola integrasi dengan payment provider dan verifikasi pembayaran.
-- **Responsibilities**: membuat sesi pembayaran ke payment provider, menerima & memverifikasi webhook, memperbarui status order menjadi `PAID`/`FAILED`, mencatat riwayat transaksi pembayaran.
-- **Data ownership**: `Payment` (riwayat transaksi, status, referensi provider).
+- **Purpose**: Mengelola integrasi dengan payment provider dan siklus hidup **pembayaran** (bukan siklus hidup order).
+- **Ownership correction (Phase 1.1)**: Payment Service **tidak memiliki dan tidak mengubah** `Order`/`OrderStatus`. Payment Service adalah pemilik tunggal atas domain pembayaran: `Payment`, `PaymentTransaction`, `ProviderReference`, `PaymentStatus`, `PaymentMetadata`, `WebhookProcessing`. Order Service tetap pemilik tunggal `Order`/`OrderItem`/`OrderStatus`/`OrderLifecycle` (lihat entri Order Service di bawah). Lihat `ARCHITECTURE.md` §9 dan §11b untuk alur dan state machine lengkap.
+- **Responsibilities**: membuat sesi pembayaran ke payment provider, menerima & memverifikasi webhook (lihat `THREAT_MODEL.md` untuk ancaman webhook), menjalankan state machine `Payment` (`INITIATED → PENDING → SUCCEEDED/FAILED/EXPIRED/CANCELLED`), mencatat riwayat transaksi pembayaran, mempublikasikan hasil verifikasi sebagai event (`PaymentSucceeded`/`PaymentFailed`) — **bukan** memanggil Order Service untuk mengubah status order.
+- **Data ownership**: `Payment`, `PaymentTransaction`, `ProviderReference`, `PaymentMetadata`, `WebhookProcessing` log.
 - **Database**: Payment DB (PostgreSQL).
-- **APIs**: gRPC internal (`CreatePayment`, `GetPaymentStatus`) + REST publik (`/payments/*`) + webhook endpoint (`/payments/webhook`).
-- **Dependencies**: Order Service (gRPC, untuk get/update order), Payment Provider (eksternal, REST + webhook).
-- **Inbound communication**: gRPC dari Gateway; webhook HTTPS dari Payment Provider.
-- **Outbound communication**: gRPC ke Order Service; REST ke Payment Provider.
-- **Events produced**: `PaymentPending`, `PaymentSuccess`, `PaymentFailed`, `OrderPaid`.
+- **APIs**: gRPC internal (`CreatePayment`, `GetPaymentStatus` — read-only untuk service lain) + REST publik (`/payments/*`) + webhook endpoint (`/payments/webhook`).
+- **Dependencies**: Order Service (gRPC, **read-only** — `GetOrder` untuk validasi amount/currency saat membuat sesi pembayaran), Payment Provider (eksternal, REST + webhook).
+- **Inbound communication**: gRPC dari Gateway; webhook HTTPS dari Payment Provider (autentikasi via signature, **bukan** JWT user — lihat §Security requirements).
+- **Outbound communication**: gRPC read-only ke Order Service; REST ke Payment Provider; event ke RabbitMQ.
+- **Events produced**: `PaymentPending` *(opsional/analytics)*, `PaymentSucceeded`, `PaymentFailed`.
 - **Events consumed**: tidak ada.
-- **Security requirements**: verifikasi signature webhook wajib sebelum diproses; idempotency terhadap webhook duplikat (payment provider dapat mengirim webhook lebih dari sekali); data pembayaran sensitif (jika ada) tidak disimpan penuh — hanya referensi/token dari provider (tidak menyimpan data kartu).
+- **Security requirements**: webhook adalah **security boundary terpisah** dari autentikasi user — payload diverifikasi melalui signature/HMAC dari provider, bukan JWT (lihat `THREAT_MODEL.md` §Payment dan ADR pembayaran terkait); idempotency wajib terhadap webhook duplikat via unique constraint pada `ProviderReference`; validasi amount/currency terhadap order sebelum menandai `SUCCEEDED`; data pembayaran sensitif tidak disimpan penuh — hanya referensi/token dari provider (tidak menyimpan data kartu, lihat `DATA_CLASSIFICATION.md`).
 - **Scaling strategy**: horizontal; webhook endpoint harus idempotent sehingga aman menerima beban tinggi dan retry.
-- **Failure modes**: jika Order Service tidak dapat dihubungi saat update status, Payment Service melakukan retry dengan backoff dan tetap menyimpan status pembayaran di Payment DB sebagai source of truth sementara (reconciliation).
-- **Observability requirements**: payment success/fail rate, webhook processing latency, webhook duplicate rate, provider error rate.
+- **Failure modes**: jika publish event ke RabbitMQ gagal setelah `Payment` berhasil ditransisikan ke `SUCCEEDED`, status pembayaran tetap benar di Payment DB (source of truth); event dipublish ulang via outbox/retry pattern (lihat `RELIABILITY.md`) tanpa mengulang efek samping pada Order Service (idempotent consumer).
+- **Observability requirements**: payment success/fail rate, webhook processing latency, webhook duplicate/rejected-signature rate, provider error rate, reconciliation job lag (lihat `OBSERVABILITY.md`).
 
 ## 6. Download Service
 
@@ -97,7 +99,7 @@
 - **Outbound communication**: gRPC ke Auth, Order, Catalog; API ke Object Storage.
 - **Events produced**: `DownloadGranted`, `DownloadCompleted` *(opsional, jika object storage dapat memberi callback/log akses)*.
 - **Events consumed**: `OrderPaid` (untuk membuat `DownloadEntitlement` secara asynchronous sebagai denormalized cache, mempercepat pengecekan tanpa selalu memanggil Order Service — opsional optimasi Phase 2; MVP dapat langsung gRPC call synchronous ke Order Service).
-- **Security requirements**: signed URL dengan TTL singkat (mis. beberapa menit), limit jumlah request signed URL per periode waktu untuk mencegah abuse, audit log setiap penerbitan signed URL dan akses.
+- **Security requirements**: signed URL dengan TTL singkat (mis. beberapa menit), limit jumlah request signed URL per periode waktu untuk mencegah abuse, audit log setiap penerbitan signed URL dan akses, pengecekan `DownloadEntitlement.status != REVOKED` sebelum penerbitan (lihat `ARCHITECTURE.md` §10 Entitlement revocation). Download Service adalah pemegang otoritas otorisasi akhir untuk download — bukan Gateway (lihat `ARCHITECTURE.md` §11a).
 - **Scaling strategy**: horizontal; beban utama adalah request penerbitan signed URL (ringan), bukan transfer file (file ditransfer langsung dari object storage ke client).
 - **Failure modes**: jika Object Storage tidak dapat dihubungi, request download gagal dengan error jelas; jika Order Service tidak dapat dihubungi, Download Service menolak request (fail-closed — tidak mengizinkan download tanpa verifikasi entitlement yang berhasil).
 - **Observability requirements**: signed URL issuance rate, download success/fail rate, abuse pattern (permintaan berulang dari IP/user yang sama), signed URL expiry hit rate.
@@ -128,9 +130,9 @@
 | API Gateway | Auth, Catalog, Order, Payment, Download | — |
 | Auth Service | — | — |
 | Catalog Service | — | — |
-| Order Service | Catalog, Auth | (opsional consume `PaymentSuccess`) |
-| Payment Service | Order, Payment Provider (eksternal) | — |
-| Download Service | Auth, Order, Catalog, Object Storage (eksternal) | `OrderPaid` (opsional, optimasi) |
+| Order Service | Catalog, Auth | consume `PaymentSucceeded`, `PaymentFailed` (satu-satunya trigger transisi ke `PAID`) |
+| Payment Service | Order (read-only, `GetOrder`), Payment Provider (eksternal) | — |
+| Download Service | Auth, Order, Catalog, Object Storage (eksternal) | consume `OrderPaid` (opsional, optimasi entitlement) |
 | Notification Service | Email Provider (eksternal) | `UserRegistered`, `OrderCreated`, `OrderPaid`, `PaymentFailed`, `DownloadGranted` |
 
 **Catatan arah dependency**: tidak ada circular dependency synchronous. Auth dan Catalog adalah *leaf service* (tidak bergantung pada service domain lain), sehingga dapat tetap tersedia meskipun service lain terganggu — ini sengaja didesain demikian untuk mengurangi blast radius kegagalan.

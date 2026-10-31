@@ -1,0 +1,12 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/auth-service ./cmd/server"
+  bin = "./tmp/auth-service"
+  include_ext = ["go", "sql", "proto"]
+  exclude_dir = ["tmp", "tests", "migrations"]
+  delay = 300
+
+[log]
+  time = true

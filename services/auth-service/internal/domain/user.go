@@ -2,24 +2,14 @@ package domain
 
 import (
 	"errors"
-	"net/mail"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-type Role string
-
-const (
-	RoleBuyer Role = "buyer"
-	RoleAdmin Role = "admin"
-)
-
-func (r Role) IsValid() bool {
-	return r == RoleBuyer || r == RoleAdmin
-}
-
+// UserStatus reflects account state without deleting the underlying row,
+// per docs/architecture/DATABASE_DESIGN.md §2 ("status - untuk mendukung
+// suspend user tanpa hapus data").
 type UserStatus string
 
 const (
@@ -27,43 +17,49 @@ const (
 	UserStatusSuspended UserStatus = "suspended"
 )
 
-func (s UserStatus) IsValid() bool {
-	return s == UserStatusActive || s == UserStatusSuspended
-}
+// Domain-level sentinel errors. Handlers/services map these to the
+// standard error envelope described in docs/architecture/API_DESIGN.md §6.
+var (
+	ErrUserNotFound      = errors.New("user not found")
+	ErrEmailAlreadyInUse = errors.New("email already in use")
+	ErrInvalidCredential = errors.New("invalid email or password")
+	ErrAccountSuspended  = errors.New("account is suspended")
+	ErrWeakPassword      = errors.New("password does not meet minimum strength requirements")
+	ErrInvalidEmail      = errors.New("email is not valid")
+)
 
+// User is the Auth Service's core aggregate. Auth Service is the sole
+// owner of this entity (docs/architecture/DATABASE_DESIGN.md §1); other
+// services only ever hold a user_id reference, never a foreign key into
+// this table.
 type User struct {
-	ID           uuid.UUID  `json:"id"`
-	Email        string     `json:"email"`
-	PasswordHash string     `json:"-"`
-	FullName     string     `json:"full_name"`
-	Role         Role       `json:"role"`
-	Status       UserStatus `json:"status"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID           uuid.UUID
+	Email        string
+	PasswordHash string
+	FullName     string
+	Role         Role
+	Status       UserStatus
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
-func ValidateEmail(email string) error {
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return errors.New("email is required")
+// NewUser builds a new buyer account in the active state. Password hashing
+// happens in the service layer (domain stays persistence/crypto agnostic).
+func NewUser(email, passwordHash, fullName string) *User {
+	now := time.Now().UTC()
+	return &User{
+		ID:           uuid.New(),
+		Email:        email,
+		PasswordHash: passwordHash,
+		FullName:     fullName,
+		Role:         RoleBuyer,
+		Status:       UserStatusActive,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
-	_, err := mail.ParseAddress(email)
-	if err != nil {
-		return errors.New("invalid email format")
-	}
-	return nil
 }
 
-func ValidatePassword(password string) error {
-	if len(password) < 8 {
-		return errors.New("password must be at least 8 characters long")
-	}
-	return nil
-}
-
-func ValidateFullName(fullName string) error {
-	if strings.TrimSpace(fullName) == "" {
-		return errors.New("full name is required")
-	}
-	return nil
+// IsActive reports whether the account is allowed to authenticate.
+func (u *User) IsActive() bool {
+	return u.Status == UserStatusActive
 }

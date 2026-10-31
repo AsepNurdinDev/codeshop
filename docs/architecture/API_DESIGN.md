@@ -19,6 +19,7 @@ Dokumen ini mendeskripsikan kontrak API secara **konseptual**. Tidak ada `.proto
 
 - Otorisasi berbasis **role** (`buyer`, `admin`) untuk operasi administratif.
 - Otorisasi berbasis **ownership** untuk resource milik user (order, payment, download) — user hanya dapat mengakses resource miliknya sendiri, divalidasi di level service (bukan hanya di Gateway).
+- **API Gateway bukan otoritas otorisasi akhir.** Gateway hanya melakukan validasi struktural token (coarse authentication); keputusan otorisasi bisnis (ownership, entitlement, status order/payment) selalu dilakukan oleh service pemilik data. Lihat `ARCHITECTURE.md` §11a untuk penjelasan lengkap dan diagram.
 
 ## 4. REST Conventions
 
@@ -160,11 +161,12 @@ Format error REST konsisten:
 ### POST /api/v1/payments/webhook
 
 - **Purpose**: Endpoint internal untuk menerima notifikasi status dari Payment Provider.
-- **Authentication**: signature-based (bukan JWT user) — verifikasi menggunakan secret/signature dari provider.
-- **Authorization**: hanya request dengan signature valid yang diproses.
+- **Authentication**: **signature-based, secara eksplisit BUKAN JWT user.** Ini adalah boundary keamanan terpisah dari seluruh endpoint lain di API ini — webhook tidak pernah membawa identitas user, hanya identitas transaksi yang diverifikasi via signature/HMAC dari provider. Lihat `THREAT_MODEL.md` §Payment dan langkah verifikasi lengkap di sana.
+- **Authorization**: hanya request dengan signature valid, schema valid, dan referensi order/amount/currency yang cocok dengan `Payment` terkait yang diproses lebih lanjut (lihat urutan validasi di `THREAT_MODEL.md`).
 - **Request**: payload sesuai format Payment Provider.
-- **Response**: `200 OK` (acknowledgement).
-- **Error cases**: `INVALID_SIGNATURE` (ditolak & dicatat sebagai security event), `DUPLICATE_EVENT` (diabaikan secara idempotent, tetap `200 OK`).
+- **Response**: `200 OK` (acknowledgement) — dikembalikan bahkan untuk event duplikat yang diabaikan, agar provider tidak terus melakukan retry pada event yang sebenarnya sudah berhasil diproses.
+- **Error cases**: `INVALID_SIGNATURE` (ditolak & dicatat di `WebhookProcessing` log sebagai security event), `SCHEMA_INVALID`, `AMOUNT_MISMATCH`, `DUPLICATE_EVENT` (diabaikan secara idempotent, tetap `200 OK`).
+- **Downstream effect**: endpoint ini **tidak** memanggil Order Service untuk mengubah status order (lihat koreksi ownership di `EVENT_DESIGN.md` §1a). Efeknya terbatas pada transisi `Payment` di Payment DB dan publish event `PaymentSucceeded`/`PaymentFailed`.
 
 ### GET /api/v1/downloads/{product_id}
 

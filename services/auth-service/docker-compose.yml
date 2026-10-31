@@ -1,0 +1,78 @@
+# Standalone Docker Compose for Auth Service local development.
+#
+# Per docs/decisions/ADR-010-kubernetes.md, Docker Compose is explicitly
+# scoped to local development only (Kubernetes is the target production
+# platform). This file spins up auth-service together with its own
+# infra dependencies (PostgreSQL, Redis, RabbitMQ) so the service can run
+# and be tested independently of the other CodeShop microservices, which
+# do not exist here yet. A root-level docker-compose.yml orchestrating all
+# services together belongs at the monorepo root once more services exist.
+
+services:
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8080:8080" # REST (public)
+      - "9090:9090" # gRPC (internal)
+    environment:
+      APP_ENV: development
+      HTTP_PORT: "8080"
+      GRPC_PORT: "9090"
+      DATABASE_URL: postgres://auth:auth@postgres:5432/auth_db?sslmode=disable
+      REDIS_ADDR: redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: codeshop.events
+      JWT_SECRET: dev-only-insecure-secret-change-me
+      ACCESS_TOKEN_TTL: 15m
+      REFRESH_TOKEN_TTL: 168h
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: auth
+      POSTGRES_DB: auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - auth_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth -d auth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  auth_postgres_data:
